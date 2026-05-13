@@ -16,6 +16,9 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +67,7 @@ jobs:
 
       - name: Read pinned upstream commit
         id: get_ref
+        shell: bash
         run: |
           TARGET_REF=$(cat ./ref)
           if [ -z "$TARGET_REF" ]; then
