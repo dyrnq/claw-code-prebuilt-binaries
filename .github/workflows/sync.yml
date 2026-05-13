@@ -1,0 +1,109 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    name: Check upstream and update ref
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Current Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch latest upstream commit
+        id: upstream
+        run: |
+          LATEST_SHA=$(git ls-remote https://github.com/ultraworkers/claw-code.git HEAD | cut -f1)
+          if [ -z "$LATEST_SHA" ]; then
+            echo "错误: 无法获取上游 commit"
+            exit 1
+          fi
+          SHORT_SHA=$(echo "$LATEST_SHA" | cut -c1-7)
+          echo "latest_sha=${LATEST_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "DEBUG LATEST_SHA=${LATEST_SHA}"
+
+      - name: Read current ref
+        id: current
+        run: |
+          CURRENT_REF=$(cat ./ref)
+          echo "current_ref=${CURRENT_REF}" >> "$GITHUB_OUTPUT"
+          echo "DEBUG CURRENT_REF=${CURRENT_REF}"
+
+      - name: Update ref if changed
+        id: update
+        run: |
+          if [ "${{ steps.current.outputs.current_ref }}" = "${{ steps.upstream.outputs.latest_sha }}" ]; then
+            echo "没有新提交，跳过。"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "发现新提交，更新 ref。"
+          echo "${{ steps.upstream.outputs.latest_sha }}" > ./ref
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push ref
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          git add ./ref
+          git commit -m "chore: bump ref to ${{ steps.upstream.outputs.short_sha }}"
+          git push origin main
+
+      - name: Create and push tag
+        if: steps.update.outputs.changed == 'true'
+        id: tag
+        run: |
+          TAG="v$(date +%Y%m%d%H%M)-${{ steps.upstream.outputs.short_sha }}"
+          git tag -a "$TAG" -m "claw-code $TAG (upstream ${{ steps.upstream.outputs.short_sha }})"
+          git push origin "$TAG"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "DEBUG TAG=${TAG}"
+
+      - name: Create GitHub Release
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+
+          cat > /tmp/release-notes.md << EOF
+          ## claw-code ${TAG}
+
+          Prebuilt binaries of [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code).
+
+          ### Assets
+          - **x86_64-unknown-linux-gnu** — Linux x86_64 (glibc)
+          - **x86_64-unknown-linux-musl** — Linux x86_64 (static musl)
+          - **aarch64-unknown-linux-musl** — Linux ARM64 (static musl)
+          - **aarch64-unknown-linux-gnu** — Linux ARM64 (glibc)
+          - **armv7-unknown-linux-musleabihf** — Linux ARMv7 (static musl)
+          - **x86_64-apple-darwin** — macOS Intel
+          - **aarch64-apple-darwin** — macOS Apple Silicon
+          - **x86_64-pc-windows-msvc** — Windows x86_64
+          EOF
+
+          gh release create "$TAG" \
+            --title "claw-code $TAG" \
+            --notes-file /tmp/release-notes.md
+
+      - name: Trigger release workflow
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          gh workflow run release.yml --ref "${{ steps.tag.outputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

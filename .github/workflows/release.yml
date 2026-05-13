@@ -1,0 +1,203 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux ──────────────────────────────────────────────
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            cross: true
+
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            cross: true
+
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            cross: true
+
+          - os: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            cross: true
+
+          # ── macOS ──────────────────────────────────────────────
+          - os: macos-14
+            target: x86_64-apple-darwin
+            cross: false
+
+          - os: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+
+          # ── Windows ────────────────────────────────────────────
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            cross: false
+
+    steps:
+      - name: Checkout Current Repo (Metadata)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Read pinned upstream commit
+        id: get_ref
+        run: |
+          TARGET_REF=$(cat ./ref)
+          if [ -z "$TARGET_REF" ]; then
+            echo "错误: ref 文件为空"
+            exit 1
+          fi
+          echo "DEBUG TARGET_REF=${TARGET_REF}"
+          echo "target_ref=${TARGET_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Target Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ultraworkers/claw-code
+          path: external_source
+          ref: ${{ steps.get_ref.outputs.target_ref }}
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install musl tools (Linux musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        working-directory: external_source/rust
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        working-directory: external_source/rust
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Set binary name
+        id: binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            echo "name=claw.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=claw" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rename artifact
+        id: rename
+        shell: bash
+        run: |
+          BIN="external_source/rust/target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}"
+          ARTIFACT="claw-${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            ARTIFACT="${ARTIFACT}.exe"
+          fi
+          cp "$BIN" "$ARTIFACT"
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.rename.outputs.artifact_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Determine version
+        id: version
+        shell: bash
+        run: echo "ref_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils zstd
+
+          mkdir -p release-assets
+          find artifacts/ -type f | while read f; do
+            BIN_NAME=$(basename "$f")
+            cp "$f" "release-assets/$BIN_NAME"
+
+            GZIP=-9    tar -caf "release-assets/${BIN_NAME}.tar.gz"  -C artifacts "$BIN_NAME"
+
+            XZ_OPT=-9e tar -caf "release-assets/${BIN_NAME}.tar.xz"  -C artifacts "$BIN_NAME"
+
+            tar -c -C artifacts "$BIN_NAME" | zstd -19 -T0 -o "release-assets/${BIN_NAME}.tar.zst"
+          done
+          cd release-assets
+          sha256sum * > sha256sums.txt
+          ls -la
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.ref_name }}"
+
+          # Ensure release exists (for standalone tag-push trigger)
+          if ! gh release view "$TAG" &>/dev/null; then
+            cat > /tmp/release-notes.md << EOF
+          ## claw-code ${TAG}
+
+          Prebuilt binaries of [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code).
+
+          ### Assets
+          - **x86_64-unknown-linux-gnu** — Linux x86_64 (glibc)
+          - **x86_64-unknown-linux-musl** — Linux x86_64 (static musl)
+          - **aarch64-unknown-linux-musl** — Linux ARM64 (static musl)
+          - **aarch64-unknown-linux-gnu** — Linux ARM64 (glibc)
+          - **armv7-unknown-linux-musleabihf** — Linux ARMv7 (static musl)
+          - **x86_64-apple-darwin** — macOS Intel
+          - **aarch64-apple-darwin** — macOS Apple Silicon
+          - **x86_64-pc-windows-msvc** — Windows x86_64
+          EOF
+            gh release create "$TAG" \
+              --title "claw-code $TAG" \
+              --notes-file /tmp/release-notes.md
+          fi
+
+          gh release upload "$TAG" release-assets/* --clobber
