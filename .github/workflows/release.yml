@@ -146,6 +146,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
       - name: Determine version
         id: version
         shell: bash
@@ -166,11 +172,9 @@ jobs:
             BIN_NAME=$(basename "$f")
             cp "$f" "release-assets/$BIN_NAME"
 
-            GZIP=-9    tar -caf "release-assets/${BIN_NAME}.tar.gz"  -C artifacts "$BIN_NAME"
-
-            XZ_OPT=-9e tar -caf "release-assets/${BIN_NAME}.tar.xz"  -C artifacts "$BIN_NAME"
-
-            tar -c -C artifacts "$BIN_NAME" | zstd -19 -T0 -o "release-assets/${BIN_NAME}.tar.zst"
+            tar -c -C artifacts "$BIN_NAME" | gzip -9       > "release-assets/${BIN_NAME}.tar.gz"
+            tar -c -C artifacts "$BIN_NAME" | xz -9e -T0    > "release-assets/${BIN_NAME}.tar.xz"
+            tar -c -C artifacts "$BIN_NAME" | zstd -19 -T0  -o "release-assets/${BIN_NAME}.tar.zst"
           done
           cd release-assets
           sha256sum * > sha256sums.txt
